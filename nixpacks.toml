@@ -1,5 +1,5 @@
-[phases.setup]
-nixPkgs = ["ffmpeg", "python311"]
+  [phases.setup]
+  nixPkgs = ["ffmpeg"]
 
-[start]
-cmd = "python main.py"
+  [start]
+  cmd = "python main.py"
