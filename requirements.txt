@@ -1,0 +1,10 @@
+fastapi==0.104.1
+uvicorn==0.24.0
+python-multipart==0.0.6
+numpy==1.26.2
+opencv-python-headless==4.8.1.78
+torch==2.1.1+cpu
+torchvision==0.16.1+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
+h5py==3.10.0
+scipy==1.11.4
