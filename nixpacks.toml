@@ -1,5 +1,5 @@
-  [phases.setup]
-  nixPkgs = ["ffmpeg"]
+ [phases.setup]
+  nixPkgs = ["ffmpeg", "libGL", "glib"]
 
   [start]
   cmd = "python main.py"
