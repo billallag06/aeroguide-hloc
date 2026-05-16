@@ -165,8 +165,10 @@ async def build_map(map_id, video_path, map_dir, images_dir):
     try:
         # Extract frames with ffmpeg
         update_status(map_dir, "extracting_frames")
-        result = subprocess.run([
-            "ffmpeg", "-i", str(video_path),
+       import shutil
+ffmpeg_cmd = shutil.which("ffmpeg") or "ffmpeg"
+result = subprocess.run([
+    ffmpeg_cmd, "-i", str(video_path),
             "-vf", "fps=2", "-q:v", "2",
             str(images_dir / "frame_%04d.jpg"), "-y"
         ], capture_output=True, text=True)
