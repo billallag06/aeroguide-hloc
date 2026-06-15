@@ -1,5 +1,6 @@
 [phases.setup]
-nixPkgs = ["ffmpeg", "libGL", "glib", "xorg.libxcb", "xorg.libSM", "xorg.libXext", "xorg.libXrender"]
+nixPkgs = ["ffmpeg"]
+aptPkgs = ["libgl1", "libglib2.0-0", "libsm6", "libxext6", "libxrender1", "libxcb1"]
 
 [start]
 cmd = "python main.py"
