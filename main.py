@@ -1,252 +1,489 @@
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn, os, shutil, tempfile, asyncio, subprocess, cv2
+import os, json, time, uuid, shutil, threading
 from pathlib import Path
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import numpy as np
+import cv2
 
-app = FastAPI(title="AeroGuide HLoc Service")
+app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-MAPS_DIR = Path("/app/maps")
-MAPS_DIR.mkdir(exist_ok=True)
+BASE     = Path("/app/maps")
+BASE.mkdir(exist_ok=True)
+STATUS   = {}
 
-# ── CONFIG OPTIMISÉ ──────────────────────────
-FPS         = 1        # 1 frame/sec (au lieu de 2) → 2x plus rapide
-MAX_FRAMES  = 60       # max 60 frames peu importe durée video
-IMG_WIDTH   = 640      # resize frames à 640px → plus léger
-IMG_HEIGHT  = 480
-MAX_VIDEO_MB = 200     # reject videos > 200MB
-# ─────────────────────────────────────────────
+# ── Try importing HLoc ───────────────────────────────────────────────────────
+HLOC_OK = False
+try:
+    from hloc import extract_features, match_features, reconstruction, pairs_from_exhaustive
+    from hloc.utils import read_write_model
+    import pycolmap
+    HLOC_OK = True
+    print("✅ HLoc loaded successfully")
+except Exception as e:
+    print(f"⚠️ HLoc not available: {e}")
 
+# ── Feature configs ──────────────────────────────────────────────────────────
+FEATURE_CONF  = extract_features.confs['superpoint_aachen'] if HLOC_OK else None
+MATCHER_CONF  = match_features.confs['superglue']           if HLOC_OK else None
 
+# ─────────────────────────────────────────────────────────────────────────────
+# HEALTH CHECK
+# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/")
 def health():
-    maps   = [m.name for m in MAPS_DIR.iterdir()] if MAPS_DIR.exists() else []
-    ffmpeg = shutil.which("ffmpeg") or "not found"
+    maps = [d.name for d in BASE.iterdir() if d.is_dir()] if BASE.exists() else []
     return {
         "status": "AeroGuide HLoc running ✅",
+        "hloc":   "✅ loaded" if HLOC_OK else "⚠️ not loaded",
         "maps":   maps,
-        "ffmpeg": ffmpeg,
-        "config": f"fps={FPS}, max_frames={MAX_FRAMES}"
+        "config": "fps=1, max_frames=60"
     }
 
-
-@app.post("/localize")
-async def localize(
-    image:  UploadFile = File(...),
-    map_id: str = Form(default="home")
+# ─────────────────────────────────────────────────────────────────────────────
+# UPLOAD & PROCESS VIDEO → HLoc map + SLAM 2D map
+# ─────────────────────────────────────────────────────────────────────────────
+@app.post("/upload")
+async def upload(
+    video: UploadFile = File(...),
+    building_id: str = Form("1"),
+    floor: str = Form("1")
 ):
-    map_dir = MAPS_DIR / map_id
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-        shutil.copyfileobj(image.file, tmp)
-        tmp_path = tmp.name
-    try:
-        sf = map_dir / "status.txt"
-        if not map_dir.exists() or not sf.exists():
-            return demo_position("Map not found")
-        if sf.read_text().strip() != "ready":
-            return demo_position("Map not ready: " + sf.read_text().strip())
-        try:
-            from hloc import localize_sfm
-            hloc_dir = map_dir / "hloc"
-            result_f = map_dir / "qresult.txt"
-            localize_sfm.main(
-                reference_sfm=hloc_dir / "sfm",
-                queries=Path(tmp_path),
-                retrieval=hloc_dir / "global-feats.h5",
-                features=hloc_dir / "features.h5",
-                matches=hloc_dir / "matches.h5",
-                results=result_f,
-                covisibility_clustering=False
-            )
-            if result_f.exists():
-                parts = result_f.read_text().strip().split("\n")[-1].split()
-                if len(parts) >= 8:
-                    return {
-                        "success": True,
-                        "x": round(float(parts[5]), 4),
-                        "y": round(float(parts[6]), 4),
-                        "z": round(float(parts[7]), 4),
-                        "confidence": 0.92,
-                        "map_id": map_id
-                    }
-        except ImportError:
-            return demo_position("HLoc not installed")
-        return demo_position("Parse error")
-    except Exception as e:
-        return demo_position(str(e))
-    finally:
-        try: os.unlink(tmp_path)
-        except: pass
-
-
-@app.post("/process")
-async def process_video(
-    video:  UploadFile = File(...),
-    map_id: str = Form(default="home")
-):
-    map_dir    = MAPS_DIR / map_id
-    images_dir = map_dir / "images"
+    map_id  = f"map_{uuid.uuid4().hex[:13]}"
+    map_dir = BASE / map_id
     map_dir.mkdir(parents=True, exist_ok=True)
-    images_dir.mkdir(exist_ok=True)
-
-    # Check file size
+    
+    # Save video
     video_path = map_dir / "video.mp4"
-    size = 0
     with open(video_path, "wb") as f:
-        while chunk := await video.read(1024 * 1024):  # 1MB chunks
-            size += len(chunk)
-            if size > MAX_VIDEO_MB * 1024 * 1024:
-                update_status(map_dir, f"failed: video too large (max {MAX_VIDEO_MB}MB)")
-                return {"success": False, "error": f"Video too large. Max {MAX_VIDEO_MB}MB"}
-            f.write(chunk)
+        f.write(await video.read())
 
-    print(f"Video saved: {size/1024/1024:.1f}MB", flush=True)
-    update_status(map_dir, "extracting_frames")
-    asyncio.create_task(build_map(map_id, video_path, map_dir, images_dir))
+    # Save metadata
+    (map_dir / "meta.json").write_text(json.dumps({
+        "building_id": building_id,
+        "floor": floor,
+        "map_id": map_id
+    }))
 
-    return {"success": True, "map_id": map_id, "status": "processing"}
+    update_status(map_id, "extracting_frames", "Extracting frames...")
 
+    # Process in background
+    threading.Thread(target=process_map, args=(map_id, map_dir, video_path), daemon=True).start()
 
+    return {"success": True, "map_id": map_id}
+
+# ─────────────────────────────────────────────────────────────────────────────
+def process_map(map_id, map_dir, video_path):
+    try:
+        imgs_dir = map_dir / "images"
+        imgs_dir.mkdir(exist_ok=True)
+
+        # ── Extract frames ───────────────────────────────────────────────────
+        cap = cv2.VideoCapture(str(video_path))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        interval = max(1, int(fps))
+        frame_idx, saved = 0, 0
+        MAX_FRAMES = 60
+
+        frame_positions = []  # For SLAM 2D map
+
+        while saved < MAX_FRAMES:
+            ret, frame = cap.read()
+            if not ret: break
+            if frame_idx % interval == 0:
+                path = imgs_dir / f"frame_{saved:04d}.jpg"
+                h, w = frame.shape[:2]
+                scale = 640 / max(w, h)
+                frame_small = cv2.resize(frame, (int(w*scale), int(h*scale)))
+                cv2.imwrite(str(path), frame_small)
+                frame_positions.append(saved)
+                saved += 1
+            frame_idx += 1
+        cap.release()
+
+        if saved < 5:
+            update_status(map_id, "failed", f"Only {saved} frames extracted")
+            return
+
+        update_status(map_id, "running_hloc", f"Running HLoc on {saved} frames...")
+
+        if HLOC_OK:
+            run_hloc(map_id, map_dir, imgs_dir, saved)
+        else:
+            # Fallback: build basic SLAM map from optical flow
+            run_slam_fallback(map_id, map_dir, imgs_dir, saved)
+
+    except Exception as e:
+        update_status(map_id, "failed", str(e))
+
+# ─────────────────────────────────────────────────────────────────────────────
+def run_hloc(map_id, map_dir, imgs_dir, n_frames):
+    try:
+        sfm_dir   = map_dir / "sfm"
+        pairs_f   = map_dir / "pairs.txt"
+        feats_f   = map_dir / "features.h5"
+        matches_f = map_dir / "matches.h5"
+
+        sfm_dir.mkdir(exist_ok=True)
+
+        # Generate pairs
+        refs = [f"frame_{i:04d}.jpg" for i in range(n_frames)]
+        pairs_from_exhaustive.main(pairs_f, image_list=refs)
+
+        # Extract features
+        extract_features.main(FEATURE_CONF, imgs_dir, image_list=refs, feature_path=feats_f)
+
+        # Match features
+        match_features.main(MATCHER_CONF, pairs_f, features=feats_f, matches=matches_f)
+
+        # COLMAP reconstruction
+        model = reconstruction.main(
+            sfm_dir, imgs_dir, pairs_f, feats_f, matches_f,
+            verbose=False
+        )
+
+        if model is None or len(model.images) < 3:
+            update_status(map_id, "failed", "COLMAP reconstruction failed")
+            return
+
+        # Extract camera positions → build 2D SLAM map
+        slam_map = extract_slam_map(model, map_id)
+        (map_dir / "slam_map.json").write_text(json.dumps(slam_map))
+
+        update_status(map_id, "ready", f"✅ Map ready! {len(model.images)} frames reconstructed")
+
+    except Exception as e:
+        update_status(map_id, "failed", f"HLoc error: {e}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+def extract_slam_map(model, map_id):
+    """
+    Extract 2D GTA-style map from COLMAP reconstruction.
+    Returns walls, path, and scale for frontend rendering.
+    """
+    positions = []
+    for img_id, img in model.images.items():
+        # Camera position in world coordinates
+        R = img.rotmat()
+        t = img.tvec
+        pos = -R.T @ t
+        positions.append({'x': float(pos[0]), 'z': float(pos[2])})
+
+    if not positions:
+        return {}
+
+    xs = [p['x'] for p in positions]
+    zs = [p['z'] for p in positions]
+
+    min_x, max_x = min(xs), max(xs)
+    min_z, max_z = min(zs), max(zs)
+
+    # Normalize to 0-500 canvas
+    W, H = 500, 500
+    pad = 40
+
+    def norm_x(x): return int(pad + (x - min_x) / max(max_x - min_x, 0.001) * (W - pad*2))
+    def norm_z(z): return int(pad + (z - min_z) / max(max_z - min_z, 0.001) * (H - pad*2))
+
+    # Path points (camera trajectory)
+    path = [{'x': norm_x(p['x']), 'z': norm_z(p['z'])} for p in positions]
+
+    # Build walls from trajectory (simplified: corridor detection)
+    walls = []
+    corridor_width = 20  # pixels
+
+    for i in range(len(path)-1):
+        p1 = path[i]
+        p2 = path[i+1]
+        dx = p2['x'] - p1['x']
+        dz = p2['z'] - p1['z']
+        length = max((dx**2 + dz**2)**0.5, 0.001)
+        nx = -dz / length * corridor_width
+        nz = dx / length * corridor_width
+
+        walls.append({
+            'x1': p1['x'] + nx, 'z1': p1['z'] + nz,
+            'x2': p2['x'] + nx, 'z2': p2['z'] + nz
+        })
+        walls.append({
+            'x1': p1['x'] - nx, 'z1': p1['z'] - nz,
+            'x2': p2['x'] - nx, 'z2': p2['z'] - nz
+        })
+
+    # Scale factor: real world units per pixel
+    real_width  = max_x - min_x
+    real_height = max_z - min_z
+    scale = max(real_width, real_height) / (W - pad*2) if (W - pad*2) > 0 else 1
+
+    return {
+        'path':     path,
+        'walls':    walls,
+        'min_x':    min_x,
+        'min_z':    min_z,
+        'max_x':    max_x,
+        'max_z':    max_z,
+        'scale':    scale,
+        'canvas_w': W,
+        'canvas_h': H,
+        'pad':      pad
+    }
+
+# ─────────────────────────────────────────────────────────────────────────────
+def run_slam_fallback(map_id, map_dir, imgs_dir, n_frames):
+    """
+    Fallback SLAM using OpenCV optical flow when HLoc not available.
+    Builds approximate 2D map from camera motion estimation.
+    """
+    update_status(map_id, "running_hloc", "Running optical flow SLAM...")
+
+    frames = sorted(imgs_dir.glob("*.jpg"))
+    if len(frames) < 3:
+        update_status(map_id, "failed", "Not enough frames")
+        return
+
+    # Track camera motion using optical flow
+    prev_gray = cv2.cvtColor(cv2.imread(str(frames[0])), cv2.COLOR_BGR2GRAY)
+    
+    positions = [{'x': 0.0, 'z': 0.0}]
+    x, z = 0.0, 0.0
+    angle = 0.0
+
+    lk_params = dict(winSize=(21,21), maxLevel=3,
+                     criteria=(cv2.TERM_CRITERIA_EPS|cv2.TERM_CRITERIA_COUNT, 30, 0.01))
+
+    for frame_path in frames[1:min(n_frames, len(frames))]:
+        curr_gray = cv2.cvtColor(cv2.imread(str(frame_path)), cv2.COLOR_BGR2GRAY)
+
+        # Detect features in previous frame
+        prev_pts = cv2.goodFeaturesToTrack(prev_gray, maxCorners=200, qualityLevel=0.01, minDistance=10)
+        if prev_pts is None or len(prev_pts) < 10:
+            prev_gray = curr_gray
+            positions.append({'x': x, 'z': z})
+            continue
+
+        # Track features
+        curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, prev_pts, None, **lk_params)
+        good_prev = prev_pts[status.flatten() == 1]
+        good_curr = curr_pts[status.flatten() == 1]
+
+        if len(good_prev) < 5:
+            prev_gray = curr_gray
+            positions.append({'x': x, 'z': z})
+            continue
+
+        # Estimate camera motion
+        try:
+            E, mask = cv2.findEssentialMat(good_curr, good_prev,
+                                            focal=700, pp=(curr_gray.shape[1]//2, curr_gray.shape[0]//2),
+                                            method=cv2.RANSAC, prob=0.999, threshold=1.0)
+            if E is not None:
+                _, R, t, _ = cv2.recoverPose(E, good_curr, good_prev,
+                                              focal=700, pp=(curr_gray.shape[1]//2, curr_gray.shape[0]//2))
+                # Accumulate translation
+                x += float(t[0][0]) * 0.5
+                z += float(t[2][0]) * 0.5
+        except:
+            pass
+
+        positions.append({'x': x, 'z': z})
+        prev_gray = curr_gray
+
+    # Build SLAM map from positions
+    if not positions:
+        update_status(map_id, "failed", "SLAM failed")
+        return
+
+    xs = [p['x'] for p in positions]
+    zs = [p['z'] for p in positions]
+    min_x, max_x = min(xs), max(xs)
+    min_z, max_z = min(zs), max(zs)
+
+    W, H, pad = 500, 500, 40
+
+    def norm_x(x): return int(pad + (x - min_x) / max(max_x - min_x, 0.001) * (W - pad*2))
+    def norm_z(z): return int(pad + (z - min_z) / max(max_z - min_z, 0.001) * (H - pad*2))
+
+    path = [{'x': norm_x(p['x']), 'z': norm_z(p['z'])} for p in positions]
+
+    # Build corridor walls
+    walls = []
+    cw = 18
+    for i in range(len(path)-1):
+        p1, p2 = path[i], path[i+1]
+        dx = p2['x'] - p1['x']
+        dz = p2['z'] - p1['z']
+        length = max((dx**2+dz**2)**0.5, 0.001)
+        nx, nz = -dz/length*cw, dx/length*cw
+        walls.append({'x1':p1['x']+nx,'z1':p1['z']+nz,'x2':p2['x']+nx,'z2':p2['z']+nz})
+        walls.append({'x1':p1['x']-nx,'z1':p1['z']-nz,'x2':p2['x']-nx,'z2':p2['z']-nz})
+
+    scale = max(max_x-min_x, max_z-min_z) / (W-pad*2) if (W-pad*2) > 0 else 1
+
+    slam_map = {
+        'path': path, 'walls': walls,
+        'min_x': min_x, 'min_z': min_z,
+        'max_x': max_x, 'max_z': max_z,
+        'scale': scale, 'canvas_w': W, 'canvas_h': H, 'pad': pad
+    }
+    (map_dir / "slam_map.json").write_text(json.dumps(slam_map))
+    update_status(map_id, "ready", f"✅ Map ready (optical flow SLAM, {len(positions)} positions)")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STATUS
+# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/status/{map_id}")
 def get_status(map_id: str):
-    sf = MAPS_DIR / map_id / "status.txt"
-    if not sf.exists():
-        return {"map_id": map_id, "status": "not_found", "ready": False}
-    status = sf.read_text().strip()
-    msgs = {
-        "extracting_frames": "Extracting video frames...",
-        "running_hloc":      "Running HLoc AI...",
-        "running_colmap":    "Building 3D map...",
-        "ready":             "Map ready ✅"
-    }
-    return {
-        "map_id":  map_id,
-        "status":  status,
-        "message": msgs.get(status, status),
-        "ready":   status == "ready"
-    }
+    if map_id in STATUS:
+        return {**STATUS[map_id], "map_id": map_id}
+    
+    map_dir = BASE / map_id
+    if map_dir.exists():
+        slam = (map_dir / "slam_map.json").exists()
+        return {"map_id": map_id, "status": "ready", "message": "✅ Map ready", "has_slam": slam}
+    
+    return {"map_id": map_id, "status": "not_found", "message": "Map not found"}
 
+# ─────────────────────────────────────────────────────────────────────────────
+# GET SLAM MAP
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/slam/{map_id}")
+def get_slam(map_id: str):
+    slam_path = BASE / map_id / "slam_map.json"
+    if not slam_path.exists():
+        raise HTTPException(404, "SLAM map not found")
+    return json.loads(slam_path.read_text())
 
-def update_status(d: Path, s: str):
-    (d / "status.txt").write_text(s)
-    print(f"[{d.name}] {s}", flush=True)
+# ─────────────────────────────────────────────────────────────────────────────
+# LOCALIZE — find position from image
+# ─────────────────────────────────────────────────────────────────────────────
+@app.post("/localize")
+async def localize(
+    image: UploadFile = File(...),
+    building_id: str = Form("1"),
+    floor: str = Form("1")
+):
+    # Find latest ready map
+    ready_maps = []
+    if BASE.exists():
+        for d in BASE.iterdir():
+            if d.is_dir() and (d/"slam_map.json").exists():
+                ready_maps.append(d)
 
+    if not ready_maps:
+        return demo_position("no_maps")
 
+    map_dir = sorted(ready_maps, key=lambda d: d.stat().st_mtime)[-1]
+
+    if not HLOC_OK:
+        return demo_position("hloc_not_loaded")
+
+    # Save query image
+    img_data = await image.read()
+    query_path = map_dir / "query_tmp.jpg"
+    query_path.write_bytes(img_data)
+
+    try:
+        result = run_hloc_localize(map_dir, query_path)
+        query_path.unlink(missing_ok=True)
+        return result
+    except Exception as e:
+        query_path.unlink(missing_ok=True)
+        return demo_position(f"localize_error: {e}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+def run_hloc_localize(map_dir, query_path):
+    sfm_dir = map_dir / "sfm"
+    if not sfm_dir.exists():
+        return demo_position("no_sfm")
+
+    try:
+        model = pycolmap.Reconstruction(str(sfm_dir))
+        
+        # Use COLMAP image_registrator for localization
+        camera = pycolmap.Camera(
+            model='SIMPLE_RADIAL',
+            width=640, height=480,
+            params=[700, 320, 240, 0]
+        )
+
+        query_img = {
+            'image': str(query_path),
+            'camera': camera
+        }
+
+        # Extract features for query
+        query_feats = map_dir / "query_feats.h5"
+        extract_features.main(
+            FEATURE_CONF,
+            query_path.parent,
+            image_list=[query_path.name],
+            feature_path=query_feats
+        )
+
+        # Match against database
+        db_feats  = map_dir / "features.h5"
+        db_pairs  = map_dir / "pairs.txt"
+        db_matches = map_dir / "matches.h5"
+
+        # Get best reference images
+        pairs_from_exhaustive.main(
+            map_dir / "query_pairs.txt",
+            image_list=[query_path.name],
+            ref_list=[f"frame_{i:04d}.jpg" for i in range(min(20, len(list(model.images))))]
+        )
+
+        match_features.main(
+            MATCHER_CONF,
+            map_dir / "query_pairs.txt",
+            features=db_feats,
+            matches=map_dir / "query_matches.h5",
+            features_ref=query_feats
+        )
+
+        # Localize
+        pose = pycolmap.absolute_pose_estimation(
+            str(query_path), model, camera
+        )
+
+        if pose and pose.success:
+            pos = pose.cam_from_world.inverse().translation
+            return {
+                "success": True,
+                "x": float(pos[0]),
+                "y": float(pos[1]),
+                "z": float(pos[2]),
+                "confidence": 0.9,
+                "demo": False
+            }
+        else:
+            return demo_position("pose_estimation_failed")
+
+    except Exception as e:
+        return demo_position(f"hloc_localize: {e}")
+
+# ─────────────────────────────────────────────────────────────────────────────
 def demo_position(reason="demo"):
+    """
+    Returns demo position with LOW confidence (< 0.5)
+    so frontend knows to IGNORE it.
+    """
     import random
     return {
         "success": True,
-        "x": round(random.uniform(0, 15), 2),
-        "y": 0.0,
-        "z": round(random.uniform(0, 25), 2),
-        "confidence": 0.85,
+        "x": random.uniform(0, 15),
+        "y": 0,
+        "z": random.uniform(0, 25),
+        "confidence": 0.3,   # ← LOW: frontend should ignore
         "demo": True,
         "reason": reason
     }
 
+# ─────────────────────────────────────────────────────────────────────────────
+def update_status(map_id, status, message=""):
+    STATUS[map_id] = {"status": status, "message": message}
+    print(f"[{map_id}] {status}: {message}")
 
-async def build_map(map_id, video_path, map_dir, images_dir):
-    try:
-        # ── ÉTAPE 1: EXTRAIRE FRAMES AVEC OPENCV ──
-        # OpenCV est plus rapide que ffmpeg sur Railway
-        update_status(map_dir, "extracting_frames")
-        print("Extracting frames with OpenCV...", flush=True)
-
-        cap      = cv2.VideoCapture(str(video_path))
-        total_fr = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps_vid  = cap.get(cv2.CAP_PROP_FPS) or 30
-
-        # Calculer step pour avoir max MAX_FRAMES frames
-        step = max(1, int(total_fr / MAX_FRAMES))
-        print(f"Video: {total_fr} frames @ {fps_vid}fps, step={step}", flush=True)
-
-        count  = 0
-        saved  = 0
-        while True:
-            ret, frame = cap.read()
-            if not ret: break
-
-            if count % step == 0 and saved < MAX_FRAMES:
-                # Resize pour réduire taille
-                frame_resized = cv2.resize(frame, (IMG_WIDTH, IMG_HEIGHT))
-                cv2.imwrite(
-                    str(images_dir / f"frame_{saved:04d}.jpg"),
-                    frame_resized,
-                    [cv2.IMWRITE_JPEG_QUALITY, 85]
-                )
-                saved += 1
-
-            count += 1
-
-        cap.release()
-        print(f"Extracted {saved} frames ✅", flush=True)
-
-        if saved < 5:
-            update_status(map_dir, "failed: too few frames")
-            return
-
-        # ── ÉTAPE 2: HLOC ──────────────────────────
-        update_status(map_dir, "running_hloc")
-        try:
-            from hloc import (
-                extract_features, match_features,
-                reconstruction, pairs_from_exhaustive
-            )
-            out     = map_dir / "hloc"
-            out.mkdir(exist_ok=True)
-            feats   = out / "features.h5"
-            pairs   = out / "pairs.txt"
-            matches = out / "matches.h5"
-            sfm     = out / "sfm"
-
-            print("SuperPoint features...", flush=True)
-            extract_features.main(
-                conf=extract_features.confs["superpoint_aachen"],
-                image_dir=images_dir,
-                export_dir=out,
-                as_half=True
-            )
-
-            print("Image pairs...", flush=True)
-            pairs_from_exhaustive.main(
-                output=pairs,
-                image_list=[p.name for p in sorted(images_dir.glob("*.jpg"))]
-            )
-
-            print("SuperGlue matching...", flush=True)
-            match_features.main(
-                conf=match_features.confs["superglue"],
-                pairs=pairs,
-                features=feats,
-                matches=matches
-            )
-
-            print("COLMAP reconstruction...", flush=True)
-            reconstruction.main(
-                sfm_dir=sfm,
-                image_dir=images_dir,
-                pairs=pairs,
-                features=feats,
-                matches=matches
-            )
-
-        except ImportError:
-            print("HLoc not installed — demo mode ✅", flush=True)
-
-        update_status(map_dir, "ready")
-        print(f"✅ Map {map_id} ready!", flush=True)
-
-        # Nettoyer video pour économiser espace
-        try:
-            video_path.unlink()
-            print("Video deleted to save space", flush=True)
-        except: pass
-
-    except Exception as e:
-        print(f"Error: {e}", flush=True)
-        update_status(map_dir, f"failed: {str(e)[:100]}")
-
-
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
