@@ -37,7 +37,7 @@ def health():
         "status": "AeroGuide HLoc running ✅",
         "hloc":   "✅ loaded" if HLOC_OK else "⚠️ not loaded",
         "maps":   maps,
-        "config": "fps=1, max_frames=60"
+        "config": "fps=1, max_frames=30"
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
