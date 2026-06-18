@@ -13,6 +13,14 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
+# Clone SuperGlue manually (no setup.py)
+RUN git clone --depth 1 \
+    https://github.com/magicleap/SuperGluePretrainedNetwork.git \
+    /app/SuperGluePretrainedNetwork
+
+# Add to Python path
+ENV PYTHONPATH="/app/SuperGluePretrainedNetwork:${PYTHONPATH}"
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
