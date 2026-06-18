@@ -83,7 +83,7 @@ def process_map(map_id, map_dir, video_path):
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
         interval = max(1, int(fps))
         frame_idx, saved = 0, 0
-        MAX_FRAMES = 60
+        MAX_FRAMES = 30
 
         frame_positions = []  # For SLAM 2D map
 
