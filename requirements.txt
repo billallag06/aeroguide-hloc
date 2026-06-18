@@ -9,4 +9,3 @@ torch
 torchvision
 pycolmap
 git+https://github.com/cvg/Hierarchical-Localization.git
-git+https://github.com/magicleap/SuperGluePretrainedNetwork.git
